@@ -2,19 +2,21 @@
 
 import os
 import sys
-import time
 import warnings
+from collections.abc import Generator
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Optional
 
 import torch
 import torch_br
 from torch_br.contrib import transfer_to_supa
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
+from loguru import logger
 from pydantic import BaseModel, Field
 
 warnings.filterwarnings("ignore")
@@ -26,35 +28,68 @@ if _src_path not in sys.path:
 from utils import AttentionBackend, ensure_model_weights, load_from_local_dir, set_attention_backend
 from zimage import generate
 
-components = None
-_device = None
+components: Optional[dict[str, Any]] = None
+_device: Optional[str | torch.device] = None
 
 
-def _select_device() -> str:
+def _select_device() -> str | torch.device:
     if torch.cuda.is_available():
-        dev = "cuda"
-        print("Chosen device: cuda")
-    else:
-        try:
-            import torch_xla
-            import torch_xla.core.xla_model as xm
-            dev = xm.xla_device()
-            print("Chosen device: tpu")
-        except (ImportError, RuntimeError):
-            if torch.backends.mps.is_available():
-                dev = "mps"
-                print("Chosen device: mps")
-            else:
-                dev = "cpu"
-                print("Chosen device: cpu")
-    return dev
+        logger.info("Chosen device: cuda")
+        return "cuda"
+
+    try:
+        import torch_xla.core.xla_model as xm
+
+        dev = xm.xla_device()
+        logger.info("Chosen device: tpu")
+        return dev
+    except (ImportError, RuntimeError):
+        if torch.backends.mps.is_available():
+            logger.info("Chosen device: mps")
+            return "mps"
+        logger.info("Chosen device: cpu")
+        return "cpu"
+
+
+def _generate_image(
+    prompt: str,
+    seed: int,
+    height: int = 1024,
+    width: int = 1024,
+    num_inference_steps: int = 8,
+    guidance_scale: float = 0.0,
+) -> Response:
+    if components is None:
+        raise HTTPException(503, "Model not loaded yet")
+
+    logger.info("Generating: prompt={}", prompt[:80].rstrip())
+    gen = torch.Generator(_device).manual_seed(seed)
+    try:
+        images = generate(
+            prompt=prompt,
+            **components,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=gen,
+            print_time=True,
+        )
+    except Exception as e:
+        logger.error("Generation failed: {}", e)
+        raise HTTPException(500, f"Generation failed: {e}")
+
+    buf = BytesIO()
+    images[0].save(buf, format="PNG")
+    logger.info("Generated {}x{} image (seed={}) in {:.1f} KB", width, height, seed, buf.tell() / 1024)
+    return Response(content=buf.getvalue(), media_type="image/png")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> Generator[None]:
     global components, _device
 
-    ckpt_dir = os.environ.get("CKPT_DIR", "ckpts/Z-Image-Turbo")
+    ckpt_dir = os.environ.get("CKPT_DIR", "/mnt/file/default-gpfsmodels/Z-Image-Turbo")
     attn_backend = os.environ.get("ZIMAGE_ATTENTION", "_native_flash")
     compile_model = os.environ.get("COMPILE", "false").lower() == "true"
     dtype = torch.bfloat16
@@ -64,9 +99,9 @@ async def lifespan(app: FastAPI):
     components = load_from_local_dir(model_path, device=_device, dtype=dtype, compile=compile_model)
     AttentionBackend.print_available_backends()
     set_attention_backend(attn_backend)
-    print(f"Chosen attention backend: {attn_backend}")
+    logger.info("Chosen attention backend: {}", attn_backend)
 
-    print("Warm up ...")
+    logger.info("Warm up ...")
     for _ in range(2):
         generate(
             prompt="warmup",
@@ -77,12 +112,12 @@ async def lifespan(app: FastAPI):
             guidance_scale=0.0,
             generator=torch.Generator(_device).manual_seed(42),
         )
-    print("Warm up done. API ready.")
+    logger.info("Warm up done. API ready.")
 
     yield
 
     components = None
-    print("Shutdown complete.")
+    logger.info("Shutdown complete.")
 
 
 app = FastAPI(title="Z-Image API", version="0.1.0", lifespan=lifespan)
@@ -98,53 +133,20 @@ class GenerateRequest(BaseModel):
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     return {"status": "ok", "model_loaded": components is not None}
 
 
-@app.post("/generate")
-def generate_image(req: GenerateRequest):
-    if components is None:
-        raise HTTPException(503, "Model not loaded yet")
-
-    gen = torch.Generator(_device).manual_seed(req.seed)
-    images = generate(
+@app.post("/v1/images/generations")
+def create_generation(req: GenerateRequest) -> Response:
+    return _generate_image(
         prompt=req.prompt,
-        **components,
+        seed=req.seed,
         height=req.height,
         width=req.width,
         num_inference_steps=req.num_inference_steps,
         guidance_scale=req.guidance_scale,
-        generator=gen,
     )
-
-    buf = BytesIO()
-    images[0].save(buf, format="PNG")
-    return Response(content=buf.getvalue(), media_type="image/png")
-
-
-@app.get("/generate")
-def generate_image_get(
-    prompt: str = Query(..., description="Text prompt"),
-    seed: int = Query(42),
-):
-    if components is None:
-        raise HTTPException(503, "Model not loaded yet")
-
-    gen = torch.Generator(_device).manual_seed(seed)
-    images = generate(
-        prompt=prompt,
-        **components,
-        height=1024,
-        width=1024,
-        num_inference_steps=8,
-        guidance_scale=0.0,
-        generator=gen,
-    )
-
-    buf = BytesIO()
-    images[0].save(buf, format="PNG")
-    return Response(content=buf.getvalue(), media_type="image/png")
 
 
 if __name__ == "__main__":
