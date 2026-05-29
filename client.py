@@ -2,6 +2,8 @@
 
 import argparse
 from pathlib import Path
+import urllib3
+urllib3.disable_warnings()
 
 import requests
 
@@ -28,6 +30,8 @@ def main():
             "guidance_scale": args.guidance,
             "seed": args.seed,
         },
+        verify=False,
+        timeout=600
     )
     resp.raise_for_status()
 
